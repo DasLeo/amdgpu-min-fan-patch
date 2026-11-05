@@ -40,6 +40,9 @@ the external `r9700_fan_min` out-of-tree module.
     LICENSE                                                          MIT (inherited from r9700-tune)
     README.md
     7.3.0/0001-amdgpu-r9700-fan-overdrive-support.patch                the patch (Linux / CachyOS 7.3.0)
+    7.4.0/0001-amdgpu-r9700-fan-overdrive-support.patch                the patch rebased onto v7.4-rc1+
+    7.4.0/dkms/                                                      DKMS packaging for distro kernels
+                                                                       (install.sh / rollback.sh / dkms.conf)
 
 ## Background: why the R9700 minimum fan PWM is wrong
 
@@ -113,13 +116,60 @@ with `patch -Np1`, so no other edit is needed:
 The patch is self-contained and independent of this repository's layout, so it
 drops into any packaging flow that applies patches at `-p1`.
 
+## Applying to a kernel 7.4-rc1 or newer
+
+Use `7.4.0/0001-amdgpu-r9700-fan-overdrive-support.patch`. It is the same
+change rebased onto `v7.4-rc1`; the 7.3.0 file does **not** apply there (two
+hunks fail, and with `patch -Np1 -F3` one silently lands in the
+`FAN_TARGET_TEMPERATURE` case — do not use fuzz on this patch).
+
+The only semantic difference: the `smu_v14_0_2_od_restore_table_single()` hunk
+is dropped, because upstream no longer forces `FAN_LEGACY_BIT` there, so there
+is nothing left to gate.
+
+## Applying to a distro kernel without rebuilding it (`amdgpu=m`)
+
+Most distro kernels build amdgpu as a **module**, so a full kernel rebuild is
+not required — the patched module can be built out-of-tree against the
+installed headers, which makes `vermagic` and the `MODVERSIONS` CRCs match the
+running kernel (the export CRCs are unchanged by this patch, so `amdxcp` and
+the rest of the stack load unaffected). `7.4.0/dkms/install.sh` wraps that as
+a DKMS package:
+
+```bash
+cd 7.4.0/dkms && sudo SRC_TREE=/path/to/patched/7.4.0-rc1 ./install.sh
+sudo reboot
+```
+
+`AUTOINSTALL="yes"`, so it rebuilds on later kernel installs; if a future
+kernel's source no longer compiles, DKMS install fails and that kernel keeps
+its stock amdgpu. Roll back with `sudo ./rollback.sh` (it restores the stock
+module DKMS archived).
+
+Two shims are needed for an out-of-tree amdgpu build, both applied by
+`install.sh`:
+
+- `amdgpu_trace.h`: `TRACE_INCLUDE_PATH ../../drivers/gpu/drm/amd/amdgpu` →
+  `.`, since that in-tree path does not exist outside a full kernel source
+  tree (`amdgpu_dm_trace.h` already uses `.` upstream).
+- `M=` in `dkms.conf` must be **absolute** — kbuild resolves a relative `M=`
+  against the `-C` directory (the headers), not the build directory.
+
 ## Runtime verification
 
-The `amdgpu` driver is built-in, so enable the override on the kernel command
-line (e.g. add to `GRUB_CMDLINE_LINUX_DEFAULT`, then `grub-mkconfig`) and reboot:
+Enable the override, then reboot. If `amdgpu` is **built-in** (the CachyOS
+case above) use the kernel command line (`GRUB_CMDLINE_LINUX_DEFAULT`, then
+`grub-mkconfig`):
 
 ```text
 amdgpu.min_fan_override=1
+```
+
+If `amdgpu` is a **module**, a modprobe option is enough (no initramfs or
+bootloader change needed):
+
+```bash
+echo 'options amdgpu min_fan_override=1' | sudo tee /etc/modprobe.d/amdgpu-minfan.conf
 ```
 
 For the GPU at `0000:03:00.0`:
@@ -128,10 +178,11 @@ For the GPU at `0000:03:00.0`:
 # the parameter took effect:
 cat /sys/module/amdgpu/parameters/min_fan_override          # -> 1
 
-# the floor is now 5% (was 20%):
+# the floor is now 5% (was 20% on the board this was written against, 25% on
+# the PowerColor card it was verified on — the VBIOS decides):
 cat /sys/bus/pci/devices/0000:03:00.0/gpu_od/fan_ctrl/fan_minimum_pwm
 #   FAN_MINIMUM_PWM:
-#   20
+#   25
 #   OD_RANGE:
 #   MINIMUM_PWM: 5 100
 
@@ -142,6 +193,11 @@ echo c > fan_minimum_pwm
 
 # clocks / voltage / power are unchanged:
 cat /sys/bus/pci/devices/0000:03:00.0/pp_od_clk_voltage
+
+# the fan is still in automatic mode: the reported PWM must sit ABOVE the
+# floor and move with load. Fixed-PWM legacy mode pins it to exactly the
+# value you set:
+rocm-smi -f -t   # e.g. floor 10%, Fan Level 27% on the loaded card
 ```
 
 Expected: the idle fan spins slower, and it still ramps up under load
@@ -168,6 +224,11 @@ git apply  /path/to/7.3.0/0001-amdgpu-r9700-fan-overdrive-support.patch
 - Actual fan-RPM behavior under load should be confirmed on real hardware.
 - The 5% floor is validated for subsystem `148c:2443`; other boards may differ,
   but the firmware still enforces its own lower bound via `OD_FAN_MIN_PWM_ERROR`.
+- The advertised stock floor is board-specific (20% and 25% both observed), so
+  read `OD_RANGE` before assuming a number.
+- Verified on 7.4.0-rc1 with `amdgpu=m`: patched module loaded,
+  `min_fan_override=1`, floor reported as 5 on two R9700s, 10% accepted and
+  committed via LACT, fan still ramping with load, no OD/SMU errors in dmesg.
 - Full-kernel LTO *link* was not run here; per-file compilation was validated
   with the exact kernel flags including `-flto`, and the code contains no
   LTO-hostile constructs.

@@ -1,0 +1,197 @@
+From 5b78d04128deb07f390713504429ec93f421e714 Mon Sep 17 00:00:00 2001
+From: Leo <wuddja@gmail.com>
+Date: Thu, 5 Nov 2026 23:35:02 +0100
+Subject: [PATCH] amdgpu/pm: opt-in minimum fan PWM override for Radeon AI PRO
+ R9700
+
+The PowerColor Radeon AI PRO R9700 (Navi 48, SMU 14.0.2) ships a VBIOS that
+advertises a conservative 20% minimum fan PWM floor through
+OverDriveLimitsBasicMin.FanMinimumPwm, and the standard OverDrive path
+(PP_OD_EDIT_FAN_MINIMUM_PWM) additionally forces the fan into fixed-PWM
+"legacy" mode (setting FAN_LEGACY_BIT and clearing FAN_CURVE_BIT) whenever
+the minimum PWM is changed.
+
+Neither reflects a real hardware constraint:
+
+  * The 20% floor is firmware/VBIOS conservatism, not a hardware limit -
+    the SMU happily accepts a much lower minimum PWM.
+
+  * Forcing legacy mode takes the fan out of automatic temperature-based
+    (fan-curve) control, so the fan no longer ramps with load. Every other
+    auto-mode fan setting in this function (acoustic limit/target, fan
+    target temperature) keeps FAN_CURVE_BIT, as does the SMU13 reference
+    driver; minimum PWM is the sole inconsistent case.
+
+Add a strictly opt-in workaround, active only when the amdgpu.min_fan_override
+module parameter is set AND the device is Navi 48 (PCI device ID 0x7551, i.e.
+SMU 14.0.2 firmware, which is guaranteed by this file being compiled for that
+SMU). It:
+
+  * relaxes the advertised minimum fan PWM floor to 5% so the standard
+    gpu_od/fan_ctrl/fan_minimum_pwm sysfs interface accepts lower values, and
+  * keeps the fan in automatic (fan-curve) mode when the minimum PWM is
+    changed, instead of switching to legacy mode.
+
+Scope and safety:
+
+  * Fully gated - a no-op unless amdgpu.min_fan_override=1 is set and the
+    device is Navi 48. Behavior on all other GPUs, and on other R9700 boards
+    whose owners do not opt in, is byte-for-byte unchanged. Each R9700 owner
+    enables it for their own board via the module parameter.
+  * Only the fan minimum PWM is affected. Clocks, memory clocks, voltage,
+    power limits, acoustic target/limit, temperature target, zero-RPM and
+    the fan curve itself are left untouched.
+  * Uses the driver's existing OverDrive state machine, locking
+    (adev->pm.mutex) and firmware error propagation, so AMDGPU's cached
+    OverDrive table stays consistent with the active SMU configuration and
+    no stale FanMinimumPwm value is reported to userspace. The external
+    upload path is not duplicated.
+  * The firmware still validates every value and rejects out-of-range ones
+    with OD_FAN_MIN_PWM_ERROR, so no thermal safety mechanism is bypassed.
+
+With this, tools such as LACT can configure a sub-20% minimum fan PWM and
+keep automatic fan control on the R9700 through the standard interface,
+making the external r9700_fan_min module unnecessary.
+
+Rebased onto v7.4-rc1: the od_restore_table_single hunk of the 7.3.0 version
+is dropped, since upstream no longer forces FAN_LEGACY_BIT there.
+
+Signed-off-by: Leo <wuddja@gmail.com>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu.h           |  1 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c       | 19 ++++++++
+ .../drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c  | 47 +++++++++++++++++--
+ 3 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+index 78a6f7431..646749328 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+@@ -170,6 +170,7 @@ extern int amdgpu_pcie_gen2;
+ extern int amdgpu_msi;
+ extern char amdgpu_lockup_timeout[AMDGPU_MAX_TIMEOUT_PARAM_LENGTH];
+ extern int amdgpu_dpm;
++extern int amdgpu_min_fan_override;
+ extern int amdgpu_fw_load_type;
+ extern int amdgpu_aspm;
+ extern int amdgpu_runtime_pm;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+index 731fe8f9e..782f79e14 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+@@ -939,6 +939,25 @@ MODULE_PARM_DESC(abmlevel,
+ 		 "ABM level (0 = off, 1-4 = backlight reduction level, -1 auto (default))");
+ module_param_named(abmlevel, amdgpu_dm_abm_level, int, 0444);
+ 
++/**
++ * DOC: min_fan_override (int)
++ * Enable the Radeon AI PRO R9700 (Navi 48, SMU 14.0.2) minimum fan PWM
++ * override. The R9700 VBIOS advertises a conservative 20% minimum fan PWM
++ * floor and the standard OverDrive path switches the fan into fixed-PWM
++ * "legacy" mode when the minimum PWM is changed, which disables automatic
++ * temperature-based fan control. When enabled, on Navi 48 hardware only, the
++ * minimum fan PWM floor is relaxed (down to 5%) and changing the minimum PWM
++ * keeps the fan in automatic (fan-curve) mode. On any other ASIC this
++ * parameter has no effect.
++ *
++ * Defaults to 0 (disabled). Only set this to 1 if you have a Radeon AI PRO
++ * R9700 and want a lower minimum fan PWM than the VBIOS default of 20%.
++ */
++int amdgpu_min_fan_override;
++MODULE_PARM_DESC(min_fan_override,
++		 "Radeon AI PRO R9700 (Navi 48, SMU 14.0.2) minimum fan PWM override (0 = disable (default), 1 = enable)");
++module_param_named(min_fan_override, amdgpu_min_fan_override, int, 0444);
++
+ int amdgpu_backlight = -1;
+ MODULE_PARM_DESC(backlight, "Backlight control (0 = pwm, 1 = aux, -1 auto (default))");
+ module_param_named(backlight, amdgpu_backlight, bint, 0444);
+diff --git a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c
+index 6a12d6f8c..251d4150d 100644
+--- a/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c
++++ b/drivers/gpu/drm/amd/pm/swsmu/smu14/smu_v14_0_2_ppt.c
+@@ -95,6 +95,9 @@ static const struct smu_feature_bits smu_v14_0_2_dpm_features = {
+ 	(BIT(PP_OD_FEATURE_FAN_CURVE_BIT) | \
+ 	 BIT(PP_OD_FEATURE_FAN_LEGACY_BIT))
+ 
++/* Radeon AI PRO R9700 (Navi 48, SMU 14.0.2) minimum fan PWM override floor. */
++#define SMU_V14_0_2_R9700_FAN_MIN_PWM_FLOOR		5
++
+ static struct cmn2asic_msg_mapping smu_v14_0_2_message_map[SMU_MSG_MAX_COUNT] = {
+ 	MSG_MAP(TestMessage,			PPSMC_MSG_TestMessage,                 1),
+ 	MSG_MAP(GetSmuVersion,			PPSMC_MSG_GetSmuVersion,               1),
+@@ -1045,6 +1048,24 @@ static u32 smu_v14_0_2_normalize_feature_mask(const OverDriveTable_t *od,
+ 	return feature_mask;
+ }
+ 
++static bool smu_v14_0_2_r9700_fan_override(struct smu_context *smu)
++{
++	struct amdgpu_device *adev = smu->adev;
++
++	/*
++	 * Opt-in only: gated behind the amdgpu.min_fan_override module
++	 * parameter so each R9700 owner can enable it on their own board.
++	 * Compiled into smu_v14_0_2_ppt.c this is already restricted to SMU
++	 * 14.0.2 firmware; additionally require Navi 48 (device ID 0x7551,
++	 * Radeon AI PRO R9700) so the parameter is a no-op on any other ASIC.
++	 */
++	if (!amdgpu_min_fan_override)
++		return false;
++	if (adev->pdev && adev->pdev->device != 0x7551)
++		return false;
++	return true;
++}
++
+ static void smu_v14_0_2_get_od_setting_limits(struct smu_context *smu,
+ 					      int od_feature_bit,
+ 					      int32_t *min,
+@@ -1098,6 +1119,8 @@ static void smu_v14_0_2_get_od_setting_limits(struct smu_context *smu,
+ 	case PP_OD_FEATURE_FAN_MINIMUM_PWM:
+ 		od_min_setting = overdrive_lowerlimits->FanMinimumPwm;
+ 		od_max_setting = overdrive_upperlimits->FanMinimumPwm;
++		if (smu_v14_0_2_r9700_fan_override(smu))
++			od_min_setting = SMU_V14_0_2_R9700_FAN_MIN_PWM_FLOOR;
+ 		break;
+ 	case PP_OD_FEATURE_FAN_ZERO_RPM_ENABLE:
+ 		od_min_setting = overdrive_lowerlimits->FanZeroRpmEnable;
+@@ -2867,8 +2890,22 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
+ 		od_table->OverDriveTable.FeatureCtrlMask &= ~BIT(PP_OD_FEATURE_FAN_LEGACY_BIT);
+ 		break;
+ 
+-	case PP_OD_EDIT_FAN_MINIMUM_PWM:
+-		if (!smu_v14_0_2_is_od_feature_supported(smu, PP_OD_FEATURE_FAN_LEGACY_BIT)) {
++	case PP_OD_EDIT_FAN_MINIMUM_PWM: {
++		int fan_feature_bit;
++
++		/*
++		 * On the Radeon AI PRO R9700 (with amdgpu.min_fan_override set)
++		 * keep the fan in automatic (fan-curve) mode when changing the
++		 * minimum PWM, matching every other auto-mode fan setting here
++		 * and the SMU13 reference. Without the override preserve the
++		 * stock legacy-mode behavior on all other hardware.
++		 */
++		if (smu_v14_0_2_r9700_fan_override(smu))
++			fan_feature_bit = PP_OD_FEATURE_FAN_CURVE_BIT;
++		else
++			fan_feature_bit = PP_OD_FEATURE_FAN_LEGACY_BIT;
++
++		if (!smu_v14_0_2_is_od_feature_supported(smu, fan_feature_bit)) {
+ 			dev_warn(adev->dev, "Fan curve setting not supported!\n");
+ 			return -ENOTSUPP;
+ 		}
+@@ -2886,9 +2923,11 @@ static int smu_v14_0_2_od_edit_dpm_table(struct smu_context *smu,
+ 
+ 		od_table->OverDriveTable.FanMinimumPwm = input[0];
+ 		od_table->OverDriveTable.FanMode = FAN_MODE_AUTO;
+-		od_table->OverDriveTable.FeatureCtrlMask |= BIT(PP_OD_FEATURE_FAN_LEGACY_BIT);
+-		od_table->OverDriveTable.FeatureCtrlMask &= ~BIT(PP_OD_FEATURE_FAN_CURVE_BIT);
++		od_table->OverDriveTable.FeatureCtrlMask |= BIT(fan_feature_bit);
++		if (fan_feature_bit == PP_OD_FEATURE_FAN_LEGACY_BIT)
++			od_table->OverDriveTable.FeatureCtrlMask &= ~BIT(PP_OD_FEATURE_FAN_CURVE_BIT);
+ 		break;
++	}
+ 
+ 	case PP_OD_EDIT_FAN_ZERO_RPM_ENABLE:
+ 		if (!smu_v14_0_2_is_od_feature_supported(smu, PP_OD_FEATURE_ZERO_FAN_BIT)) {
+-- 
+2.53.0
+
